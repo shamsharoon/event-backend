@@ -33,10 +33,8 @@ def get_calendar_events(credentials, time_min, time_max):
         ).execute()
         return events_result.get('items', [])
     except HttpError as error:
-        print(f'An error occurred: {error}')
         raise
     except Exception as e:
-        print(f'Unexpected error: {e}')
         raise
 
 def get_freebusy_data(credentials, time_min, time_max):
@@ -81,10 +79,8 @@ def get_freebusy_data(credentials, time_min, time_max):
         return {'busy': merged_busy}
     
     except HttpError as error:
-        print(f'An error occurred: {error}')
         raise
     except Exception as e:
-        print(f'Unexpected error: {e}')
         raise
 
 def create_calendar_event(credentials, event_data):
@@ -101,10 +97,8 @@ def create_calendar_event(credentials, event_data):
         ).execute()
         return event
     except HttpError as error:
-        print(f'An error occurred: {error}')
         raise
     except Exception as e:
-        print(f'Unexpected error: {e}')
         raise
 
 # For testing when real auth isn't available

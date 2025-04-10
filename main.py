@@ -58,7 +58,7 @@ async def auth_status(request: Request):
     return {"authenticated": credentials is not None}
 
 @app.get("/schedule")
-async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
+async def get_schedule(request: Request, days_ahead: Optional[int] = 5):
     try:
         # Time range for availability check (next 7 days by default)
         now = datetime.now(timezone.utc)
@@ -76,15 +76,6 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
                 freebusy_data = get_freebusy_data(credentials, time_min, time_max)
                 busy_periods = freebusy_data.get('busy', [])
                 
-                # Log the API response for debugging
-                print("\n===== GOOGLE CALENDAR API RESPONSE =====")
-                print(f"Time range: {time_min} to {time_max}")
-                print(f"Freebusy data: {json.dumps(freebusy_data, indent=2)}")
-                print(f"Number of busy periods: {len(busy_periods)}")
-                for i, busy in enumerate(busy_periods[:5]):  # Log first 5 busy periods
-                    print(f"Busy period {i+1}: {busy.get('start')} to {busy.get('end')}")
-                print("=======================================\n")
-                
                 # Get the user's calendar information for better recommendations
                 calendar_events = get_calendar_events(credentials, time_min, time_max)
                 
@@ -99,13 +90,9 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
             
             # Generate available time slots (9 AM to 7 PM, hourly slots)
             all_slots = []
-            # Track available weekend slots for debugging
-            weekend_slots = []
-            
             for day in range(days_ahead):
                 date = now + timedelta(days=day)
                 # Include all days including weekends
-                is_weekend = date.weekday() >= 5  # 5=Saturday, 6=Sunday
                 
                 # Generate slots for 9 AM to 7 PM with 30-min intervals for more flexibility
                 for hour in range(9, 19):  # End at 6:30 PM for 1-hour slots
@@ -152,26 +139,11 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
                         
                         if is_available:
                             all_slots.append(slot_str)
-                            # Track weekend slots separately for debugging
-                            if is_weekend:
-                                weekend_slots.append(slot_str)
             
             # Sort slots by date/time
             all_slots.sort()
             
-            # Log weekend slots for debugging
-            print("\n===== AVAILABLE WEEKEND SLOTS =====")
-            print(f"Total weekend slots found: {len(weekend_slots)}")
-            for i, slot in enumerate(weekend_slots[:10]):  # Log up to 10 weekend slots
-                slot_dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
-                print(f"Weekend slot {i+1}: {slot_dt.strftime('%A, %Y-%m-%d %H:%M')}")
-            print("=================================\n")
-            
-            # Log all slots for debugging
-            print(f"Total available slots: {len(all_slots)}")
-            print(f"First 5 available slots: {all_slots[:5]}")
-            
-            # Return all available slots, not just 15
+            # Use up to 15 available slots
             available_slots = all_slots
             
             # Generate smart recommendations based on the calendar data
@@ -190,38 +162,13 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
             
         except Exception as calendar_err:
             # Fallback to mock data if calendar integration fails
-            print(f"Google Calendar integration failed: {str(calendar_err)}")
-            # Mock data as fallback
-            # Calculate some dates including weekends
-            current_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            # Get next Saturday
-            days_until_saturday = (5 - current_date.weekday()) % 7
-            if days_until_saturday == 0:
-                days_until_saturday = 7  # If today is Saturday, get next Saturday
-            next_saturday = current_date + timedelta(days=days_until_saturday)
-            # Get next Sunday
-            next_sunday = next_saturday + timedelta(days=1)
-            
             available_slots = [
-                (now + timedelta(days=1, hours=10)).isoformat(),  # Weekday
-                (now + timedelta(days=1, hours=14)).isoformat(),  # Weekday
-                (now + timedelta(days=2, hours=9)).isoformat(),   # Weekday
-                (now + timedelta(days=2, hours=13)).isoformat(),  # Weekday
-                (next_saturday + timedelta(hours=10)).isoformat(),  # Saturday 10 AM
-                (next_saturday + timedelta(hours=14)).isoformat(),  # Saturday 2 PM
-                (next_sunday + timedelta(hours=12)).isoformat(),    # Sunday 12 PM
-                (next_sunday + timedelta(hours=16)).isoformat(),    # Sunday 4 PM
+                (now + timedelta(days=1, hours=10)).isoformat(),
+                (now + timedelta(days=1, hours=14)).isoformat(),
+                (now + timedelta(days=2, hours=9)).isoformat(),
+                (now + timedelta(days=2, hours=13)).isoformat(),
+                (now + timedelta(days=2, hours=16)).isoformat(),
             ]
-            
-            print("\n===== MOCK DATA INCLUDES WEEKEND SLOTS =====")
-            print(f"Next Saturday: {next_saturday.isoformat()}")
-            print(f"Next Sunday: {next_sunday.isoformat()}")
-            for slot in available_slots:
-                dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
-                day_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][dt.weekday()]
-                print(f"Mock slot: {day_name}, {dt.isoformat()}")
-            print("=========================================\n")
-            
             recommendation = "Based on your calendar availability, these are the open slots in the next few days."
             
             return {
@@ -232,7 +179,6 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
             
     except Exception as e:
         # Proper FastAPI error handling
-        print(f"Error in get_schedule: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to process schedule: {str(e)}")
 
 # Helper functions for analyzing calendar patterns
@@ -333,7 +279,6 @@ async def create_event(request: Request, event: EventCreate):
         return {"status": "success", "event_id": result.get("id")}
         
     except Exception as e:
-        print(f"Error creating event: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create event: {str(e)}")
 
 @app.post("/schedule/process-command")
@@ -371,9 +316,6 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
             slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
             
             friendly_date = slot_dt.strftime("%A, %B %d at %I:%M %p")
-            print(f"Debug - Found slot: {best_slot}")
-            print(f"Debug - Event name: {event_name}")
-            print(f"Debug - Date components: Y={slot_dt.year} M={slot_dt.month} D={slot_dt.day}")
             
             return {
                 "found_slot": best_slot,
@@ -390,7 +332,6 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
             }
             
     except Exception as e:
-        print(f"Error processing command: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to process command: {str(e)}")
 
 def extract_event_info(command):

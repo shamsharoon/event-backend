@@ -89,7 +89,6 @@ async def oauth2_callback(request: Request):
             </html>
         """)
     except Exception as e:
-        print(f"Error fetching token: {e}")
         return HTMLResponse(f"<h1>Authentication failed</h1><p>Error details: {str(e)}</p>")
 
 @router.get("/auth/logout")
@@ -106,5 +105,4 @@ async def logout(request: Request):
             
         return {"status": "success", "message": "Successfully logged out"}
     except Exception as e:
-        print(f"Error during logout: {e}")
         return {"status": "error", "message": str(e)}
