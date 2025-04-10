@@ -12,6 +12,7 @@ from fastapi.security import OAuth2PasswordBearer
 import json
 import os
 from starlette.middleware.sessions import SessionMiddleware
+import re
 
 app = FastAPI()
 app.include_router(auth_router)
@@ -31,6 +32,9 @@ class EventCreate(BaseModel):
     start_time: str
     summary: str
     description: Optional[str] = None
+
+class NaturalLanguageCommand(BaseModel):
+    command: str
 
 # Mock credentials for development - in production use proper auth flow
 class MockCredentials:
@@ -72,6 +76,15 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
                 freebusy_data = get_freebusy_data(credentials, time_min, time_max)
                 busy_periods = freebusy_data.get('busy', [])
                 
+                # Log the API response for debugging
+                print("\n===== GOOGLE CALENDAR API RESPONSE =====")
+                print(f"Time range: {time_min} to {time_max}")
+                print(f"Freebusy data: {json.dumps(freebusy_data, indent=2)}")
+                print(f"Number of busy periods: {len(busy_periods)}")
+                for i, busy in enumerate(busy_periods[:5]):  # Log first 5 busy periods
+                    print(f"Busy period {i+1}: {busy.get('start')} to {busy.get('end')}")
+                print("=======================================\n")
+                
                 # Get the user's calendar information for better recommendations
                 calendar_events = get_calendar_events(credentials, time_min, time_max)
                 
@@ -84,17 +97,18 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
                 busy_periods = freebusy_data.get('busy', [])
                 context_info = "User prefers afternoon meetings on Tuesdays and morning meetings on Thursdays."
             
-            # Generate available time slots (9 AM to 5 PM, hourly slots)
+            # Generate available time slots (9 AM to 7 PM, hourly slots)
             all_slots = []
+            # Track available weekend slots for debugging
+            weekend_slots = []
+            
             for day in range(days_ahead):
                 date = now + timedelta(days=day)
-                # Skip weekends (5=Saturday, 6=Sunday)
-                if date.weekday() >= 5:
-                    continue
+                # Include all days including weekends
+                is_weekend = date.weekday() >= 5  # 5=Saturday, 6=Sunday
                 
-                # Generate slots for 9 AM to 5 PM with 30-min intervals for more flexibility
-                # Instead of using UTC timezone, generate slots in local timezone
-                for hour in range(9, 17):  # End at 4:30 PM for 1-hour slots
+                # Generate slots for 9 AM to 7 PM with 30-min intervals for more flexibility
+                for hour in range(9, 19):  # End at 6:30 PM for 1-hour slots
                     for minute in [0, 30]:  # Add 30-minute intervals
                         # Create slot in UTC time but representing local office hours (9-5)
                         slot_time = datetime(
@@ -138,12 +152,27 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
                         
                         if is_available:
                             all_slots.append(slot_str)
+                            # Track weekend slots separately for debugging
+                            if is_weekend:
+                                weekend_slots.append(slot_str)
             
             # Sort slots by date/time
             all_slots.sort()
             
-            # Use up to 15 available slots
-            available_slots = all_slots[:15]
+            # Log weekend slots for debugging
+            print("\n===== AVAILABLE WEEKEND SLOTS =====")
+            print(f"Total weekend slots found: {len(weekend_slots)}")
+            for i, slot in enumerate(weekend_slots[:10]):  # Log up to 10 weekend slots
+                slot_dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
+                print(f"Weekend slot {i+1}: {slot_dt.strftime('%A, %Y-%m-%d %H:%M')}")
+            print("=================================\n")
+            
+            # Log all slots for debugging
+            print(f"Total available slots: {len(all_slots)}")
+            print(f"First 5 available slots: {all_slots[:5]}")
+            
+            # Return all available slots, not just 15
+            available_slots = all_slots
             
             # Generate smart recommendations based on the calendar data
             recommended_slots = get_recommended_slots(available_slots, context_info)
@@ -163,13 +192,36 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 7):
             # Fallback to mock data if calendar integration fails
             print(f"Google Calendar integration failed: {str(calendar_err)}")
             # Mock data as fallback
+            # Calculate some dates including weekends
+            current_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Get next Saturday
+            days_until_saturday = (5 - current_date.weekday()) % 7
+            if days_until_saturday == 0:
+                days_until_saturday = 7  # If today is Saturday, get next Saturday
+            next_saturday = current_date + timedelta(days=days_until_saturday)
+            # Get next Sunday
+            next_sunday = next_saturday + timedelta(days=1)
+            
             available_slots = [
-                (now + timedelta(days=1, hours=10)).isoformat(),
-                (now + timedelta(days=1, hours=14)).isoformat(),
-                (now + timedelta(days=2, hours=9)).isoformat(),
-                (now + timedelta(days=2, hours=13)).isoformat(),
-                (now + timedelta(days=2, hours=16)).isoformat(),
+                (now + timedelta(days=1, hours=10)).isoformat(),  # Weekday
+                (now + timedelta(days=1, hours=14)).isoformat(),  # Weekday
+                (now + timedelta(days=2, hours=9)).isoformat(),   # Weekday
+                (now + timedelta(days=2, hours=13)).isoformat(),  # Weekday
+                (next_saturday + timedelta(hours=10)).isoformat(),  # Saturday 10 AM
+                (next_saturday + timedelta(hours=14)).isoformat(),  # Saturday 2 PM
+                (next_sunday + timedelta(hours=12)).isoformat(),    # Sunday 12 PM
+                (next_sunday + timedelta(hours=16)).isoformat(),    # Sunday 4 PM
             ]
+            
+            print("\n===== MOCK DATA INCLUDES WEEKEND SLOTS =====")
+            print(f"Next Saturday: {next_saturday.isoformat()}")
+            print(f"Next Sunday: {next_sunday.isoformat()}")
+            for slot in available_slots:
+                dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
+                day_name = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][dt.weekday()]
+                print(f"Mock slot: {day_name}, {dt.isoformat()}")
+            print("=========================================\n")
+            
             recommendation = "Based on your calendar availability, these are the open slots in the next few days."
             
             return {
@@ -283,6 +335,225 @@ async def create_event(request: Request, event: EventCreate):
     except Exception as e:
         print(f"Error creating event: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create event: {str(e)}")
+
+@app.post("/schedule/process-command")
+async def process_command(request: Request, command_request: NaturalLanguageCommand):
+    """Process natural language scheduling commands"""
+    credentials = request.session.get("credentials")
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated with Google Calendar"
+        )
+        
+    try:
+        command = command_request.command.lower()
+        
+        # Get current available slots
+        now = datetime.now(timezone.utc)
+        time_max = (now + timedelta(days=14)).isoformat()
+        
+        # Get actual free/busy data from Google Calendar API
+        freebusy_data = get_freebusy_data(credentials, now.isoformat(), time_max)
+        busy_periods = freebusy_data.get('busy', [])
+        
+        # Extract potential date and time from command
+        event_name, event_date, event_time, description = extract_event_info(command)
+        
+        # Generate all available slots
+        available_slots = generate_available_slots(now, 14, busy_periods)
+        
+        # Find matching slots
+        matching_slots = find_matching_slots(available_slots, event_date, event_time)
+        
+        if matching_slots:
+            best_slot = matching_slots[0]
+            slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
+            
+            friendly_date = slot_dt.strftime("%A, %B %d at %I:%M %p")
+            print(f"Debug - Found slot: {best_slot}")
+            print(f"Debug - Event name: {event_name}")
+            print(f"Debug - Date components: Y={slot_dt.year} M={slot_dt.month} D={slot_dt.day}")
+            
+            return {
+                "found_slot": best_slot,
+                "event_name": event_name,
+                "event_description": description,
+                "message": f"Found a slot for '{event_name}' on {friendly_date}. Click 'Schedule Event' to confirm."
+            }
+        else:
+            return {
+                "found_slot": None,
+                "event_name": event_name,
+                "event_description": description,
+                "message": f"Could not find an available slot for '{event_name}' on the requested date/time. Please select a date and time manually."
+            }
+            
+    except Exception as e:
+        print(f"Error processing command: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process command: {str(e)}")
+
+def extract_event_info(command):
+    """Extract event name, date, time, and description from command"""
+    # Default values
+    event_name = None
+    event_date = None
+    event_time = None
+    description = None
+    
+    # Extract event name (simplistic approach - first part of the command)
+    name_match = re.search(r'schedule\s+(?:an?|the)\s+(.+?)(?:\s+on\s+|\s+at\s+|\s+for\s+|$)', command)
+    if name_match:
+        event_name = name_match.group(1).strip()
+    else:
+        # Fallback - take everything after "schedule"
+        name_match = re.search(r'schedule\s+(.+?)(?:\s+on\s+|\s+at\s+|\s+for\s+|$)', command)
+        if name_match:
+            event_name = name_match.group(1).strip()
+    
+    # Extract date
+    days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+    day_pattern = '|'.join(days)
+    
+    date_match = re.search(f'(?:on|this|next)\\s+({day_pattern})', command)
+    if date_match:
+        day_name = date_match.group(1).lower()
+        day_index = days.index(day_name)
+        
+        # Calculate date
+        today = datetime.now()
+        current_day_idx = today.weekday()  # 0 = Monday, 6 = Sunday
+        
+        if "next" in command:
+            # Next week's day
+            days_ahead = (day_index - current_day_idx) % 7 + 7
+        else:
+            # This week's day
+            days_ahead = (day_index - current_day_idx) % 7
+            
+            # If it's today or in the past, assume next week
+            if days_ahead == 0 and "today" not in command:
+                days_ahead = 7
+                
+        target_date = today + timedelta(days=days_ahead)
+        event_date = {
+            'year': target_date.year,
+            'month': target_date.month,
+            'day': target_date.day
+        }
+    
+    # Extract time
+    time_match = re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', command)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2)) if time_match.group(2) else 0
+        am_pm = time_match.group(3)
+        
+        # Convert to 24-hour format
+        if am_pm:
+            if am_pm.lower() == 'pm' and hour < 12:
+                hour += 12
+            elif am_pm.lower() == 'am' and hour == 12:
+                hour = 0
+        elif hour < 8:  # Assume PM for ambiguous times (e.g., "at 5")
+            hour += 12
+            
+        event_time = {'hour': hour, 'minute': minute}
+    
+    # Extract description (anything after "for" or "to")
+    desc_match = re.search(r'(?:for|to)\s+(.+?)$', command)
+    if desc_match:
+        description = desc_match.group(1).strip()
+    
+    return event_name, event_date, event_time, description
+
+def generate_available_slots(start_date, days_ahead, busy_periods):
+    """Generate available time slots based on busy periods"""
+    available_slots = []
+    
+    for day in range(days_ahead):
+        date = start_date + timedelta(days=day)
+        # Include all days including weekends
+        
+        # Generate slots for 9 AM to 7 PM with 30-min intervals for more flexibility
+        for hour in range(9, 19):  # End at 6:30 PM for 1-hour slots
+            for minute in [0, 30]:  # Add 30-minute intervals
+                slot_time = datetime(
+                    date.year, date.month, date.day, 
+                    hour, minute, tzinfo=timezone.utc
+                )
+                
+                # Skip slots in the past
+                if slot_time <= start_date:
+                    continue
+                
+                # Check if slot conflicts with busy periods
+                is_available = True
+                for busy in busy_periods:
+                    # Make sure both times have proper timezone information
+                    busy_start = busy['start'] 
+                    busy_end = busy['end']
+                    
+                    # Ensure we have timezone info - use UTC (Z) if none provided
+                    if 'Z' not in busy_start and '+' not in busy_start and '-' not in busy_start:
+                        busy_start = busy_start + 'Z'
+                    if 'Z' not in busy_end and '+' not in busy_end and '-' not in busy_end:
+                        busy_end = busy_end + 'Z'
+                        
+                    # Parse to datetime objects with timezone
+                    busy_start = datetime.fromisoformat(busy_start.replace('Z', '+00:00'))
+                    busy_end = datetime.fromisoformat(busy_end.replace('Z', '+00:00'))
+                    
+                    # 1-hour slots, so check if any part overlaps with busy period
+                    slot_end = slot_time + timedelta(hours=1)
+                    
+                    # If slot overlaps with busy period, mark as unavailable
+                    if (busy_start <= slot_time < busy_end) or \
+                       (busy_start < slot_end <= busy_end) or \
+                       (slot_time <= busy_start and slot_end >= busy_end):
+                        is_available = False
+                        break
+                
+                if is_available:
+                    available_slots.append(slot_time.isoformat())
+    
+    return available_slots
+
+def find_matching_slots(available_slots, event_date, event_time):
+    """Find slots that match the requested date and time"""
+    if not available_slots:
+        return []
+        
+    matching_slots = []
+    
+    for slot in available_slots:
+        slot_dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
+        
+        # Check if date matches
+        date_matches = True
+        if event_date:
+            if (slot_dt.year != event_date['year'] or 
+                slot_dt.month != event_date['month'] or 
+                slot_dt.day != event_date['day']):
+                date_matches = False
+        
+        # Check if time matches (within 1 hour)
+        time_matches = True
+        if event_time and date_matches:
+            hour_diff = abs(slot_dt.hour - event_time['hour'])
+            
+            # Check if the time is within 2 hours of requested time
+            if hour_diff > 2:
+                time_matches = False
+                
+            # If minutes are specified, check them too (within 30 min)
+            if 'minute' in event_time and abs(slot_dt.minute - event_time['minute']) > 30:
+                time_matches = False
+        
+        if date_matches and time_matches:
+            matching_slots.append(slot)
+    
+    return matching_slots
 
 @app.get("/session/clear")
 async def clear_session(request: Request):
