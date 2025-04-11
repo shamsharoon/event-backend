@@ -377,11 +377,13 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
         current_time = datetime.now(timezone.utc)
         available_slots = [slot for slot in available_slots if datetime.fromisoformat(slot.replace('Z', '+00:00')) > current_time]
         
-        # Format the available slots for the OpenAI API
+        # Format the available slots for the OpenAI API with timezone adjustment
         formatted_slots = []
         for slot in available_slots[:20]:  # Limit to first 20 slots to keep prompt size reasonable
             slot_dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
-            formatted_slots.append(f"{slot} - {slot_dt.strftime('%A, %B %d at %I:%M %p')}")
+            # Adjust for timezone (+2 hours)
+            adjusted_dt = slot_dt + timedelta(hours=2)
+            formatted_slots.append(f"{slot} - {adjusted_dt.strftime('%A, %B %d at %I:%M %p')}")
         
         available_slots_str = "\n".join(formatted_slots)
         
@@ -399,10 +401,22 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
             
             if matching_slots:
                 best_slot = matching_slots[0]
-                slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
+                # Always use consistent date formatting for the message
+                try:
+                    slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
+                    # Adjust for timezone (+2 hours)
+                    adjusted_dt = slot_dt + timedelta(hours=2)
+                    friendly_date = adjusted_dt.strftime("%A, %B %d at %I:%M %p")
+                    
+                    # Also adjust the actual slot time by +2 hours
+                    best_slot = adjusted_dt.isoformat()
+                except Exception:
+                    friendly_date = "the requested time"
                 
-                friendly_date = slot_dt.strftime("%A, %B %d at %I:%M %p")
-                
+                # Use default event name if none extracted
+                if not event_name:
+                    event_name = "Event"
+                    
                 return {
                     "found_slot": best_slot,
                     "event_name": event_name,
@@ -437,6 +451,13 @@ def process_with_openai(command, available_slots):
         current_dt = datetime.now()
         today_str = current_dt.strftime("%A, %B %d, %Y")
         
+        # Extract just the ISO dates from the formatted strings for validation later
+        available_iso_slots = []
+        for slot_str in available_slots.split("\n"):
+            if " - " in slot_str:
+                iso_part = slot_str.split(" - ")[0].strip()
+                available_iso_slots.append(iso_part)
+            
         # Create a prompt for OpenAI
         prompt = f"""
         Today is {today_str}.
@@ -451,8 +472,10 @@ def process_with_openai(command, available_slots):
         
         IMPORTANT:
         1. Only return slots that are in the future (after {today_str})
-        2. Only recommend slots from the provided available slots list
+        2. Only recommend slots from the provided available slots list 
         3. Do not make up or suggest slots that are not in the list
+        4. Make sure to use the ISO datetime string exactly as given in the list
+        5. For the found_slot, use the exact ISO string from the list, not the adjusted time
         
         Respond with a valid JSON object in this exact format:
         {{
@@ -484,6 +507,52 @@ def process_with_openai(command, available_slots):
             # Parse the JSON response from OpenAI
             import json
             parsed_result = json.loads(content)
+            
+            # Ensure the message is consistent with the found slot
+            if parsed_result.get("found_slot"):
+                try:
+                    # Validate that the found slot is one of our available slots
+                    found_slot = parsed_result["found_slot"]
+                    
+                    # If the slot has timezone info with 'Z', standardize it
+                    if found_slot.endswith('Z'):
+                        found_slot = found_slot[:-1] + '+00:00'
+                        
+                    # Check if the slot is in our available slots
+                    slot_found = False
+                    for avail_slot in available_iso_slots:
+                        if avail_slot.endswith('Z'):
+                            avail_slot = avail_slot[:-1] + '+00:00'
+                            
+                        if found_slot == avail_slot:
+                            slot_found = True
+                            # Ensure we use exactly the same format as in our available slots
+                            parsed_result["found_slot"] = avail_slot
+                            break
+                            
+                    if not slot_found:
+                        # If OpenAI returned an invalid slot, set to None
+                        parsed_result["found_slot"] = None
+                        parsed_result["message"] = "Could not find a matching available slot. Please select a date and time manually."
+                        return parsed_result
+                    
+                    # Format the date consistently for the message with timezone adjustment
+                    slot_dt = datetime.fromisoformat(parsed_result["found_slot"].replace('Z', '+00:00'))
+                    
+                    # Adjust the actual ISO datetime in found_slot by +2 hours
+                    adjusted_slot_dt = slot_dt + timedelta(hours=2)
+                    parsed_result["found_slot"] = adjusted_slot_dt.isoformat()
+                    
+                    # Adjust for timezone (+2 hours) for display message only
+                    friendly_date = adjusted_slot_dt.strftime("%A, %B %d at %I:%M %p")
+                    event_name = parsed_result.get("event_name", "Event")
+                    
+                    # Ensure message is consistent with the slot
+                    parsed_result["message"] = f"Found a slot for '{event_name}' on {friendly_date}. Click 'Schedule Event' to confirm."
+                except Exception:
+                    # If there's any error in validation, set to None
+                    parsed_result["found_slot"] = None
+                    parsed_result["message"] = "Could not validate the available slot. Please select a date and time manually."
             
             return parsed_result
         else:
