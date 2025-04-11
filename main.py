@@ -58,12 +58,25 @@ async def auth_status(request: Request):
     return {"authenticated": credentials is not None}
 
 @app.get("/schedule")
-async def get_schedule(request: Request, days_ahead: Optional[int] = 5):
+async def get_schedule(request: Request, days_ahead: Optional[int] = 5, selected_date: Optional[str] = None):
     try:
-        # Time range for availability check (next 7 days by default)
+        # Time range for availability check
         now = datetime.now(timezone.utc)
-        time_min = now.isoformat()
-        time_max = (now + timedelta(days=days_ahead)).isoformat()
+        
+        # If a specific date is selected, only fetch data for that date
+        if selected_date:
+            try:
+                # Parse the selected date
+                selected_dt = datetime.fromisoformat(selected_date.replace('Z', '+00:00'))
+                # Set time range to just that day
+                time_min = datetime(selected_dt.year, selected_dt.month, selected_dt.day, 0, 0, tzinfo=timezone.utc).isoformat()
+                time_max = datetime(selected_dt.year, selected_dt.month, selected_dt.day, 23, 59, tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format")
+        else:
+            # Default behavior - fetch next 5 days
+            time_min = now.isoformat()
+            time_max = (now + timedelta(days=days_ahead)).isoformat()
         
         # Get credentials from session
         credentials = get_credentials(request)
@@ -90,14 +103,13 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 5):
             
             # Generate available time slots (9 AM to 7 PM, hourly slots)
             all_slots = []
-            for day in range(days_ahead):
-                date = now + timedelta(days=day)
-                # Include all days including weekends
-                
-                # Generate slots for 9 AM to 7 PM with 30-min intervals for more flexibility
-                for hour in range(9, 19):  # End at 6:30 PM for 1-hour slots
+            
+            # If a specific date is selected, only generate slots for that date
+            if selected_date:
+                date = datetime.fromisoformat(selected_date.replace('Z', '+00:00'))
+                # Generate slots for 9 AM to 7 PM with 30-min intervals
+                for hour in range(9, 21):  # End at 8:30 PM for 1-hour slots
                     for minute in [0, 30]:  # Add 30-minute intervals
-                        # Create slot in UTC time but representing local office hours (9-5)
                         slot_time = datetime(
                             date.year, date.month, date.day, 
                             hour, minute, tzinfo=timezone.utc
@@ -139,12 +151,60 @@ async def get_schedule(request: Request, days_ahead: Optional[int] = 5):
                         
                         if is_available:
                             all_slots.append(slot_str)
+            else:
+                # Original behavior for multiple days
+                for day in range(days_ahead):
+                    date = now + timedelta(days=day)
+                    # Generate slots for 9 AM to 7 PM with 30-min intervals
+                    for hour in range(9, 19):  # End at 6:30 PM for 1-hour slots
+                        for minute in [0, 30]:  # Add 30-minute intervals
+                            slot_time = datetime(
+                                date.year, date.month, date.day, 
+                                hour, minute, tzinfo=timezone.utc
+                            )
+                            
+                            # Skip slots in the past
+                            if slot_time <= now:
+                                continue
+                                
+                            # Format as ISO string - includes timezone info with Z suffix
+                            slot_str = slot_time.isoformat()
+                            
+                            # Check if slot conflicts with busy periods
+                            is_available = True
+                            for busy in busy_periods:
+                                # Make sure both times have proper timezone information
+                                busy_start = busy['start']
+                                busy_end = busy['end']
+                                
+                                # Ensure we have timezone info - use UTC (Z) if none provided
+                                if 'Z' not in busy_start and '+' not in busy_start and '-' not in busy_start:
+                                    busy_start = busy_start + 'Z'
+                                if 'Z' not in busy_end and '+' not in busy_end and '-' not in busy_end:
+                                    busy_end = busy_end + 'Z'
+                                    
+                                # Parse to datetime objects with timezone
+                                busy_start = datetime.fromisoformat(busy_start.replace('Z', '+00:00'))
+                                busy_end = datetime.fromisoformat(busy_end.replace('Z', '+00:00'))
+                                
+                                # 1-hour slots, so check if any part overlaps with busy period
+                                slot_end = slot_time + timedelta(hours=1)
+                                
+                                # If slot overlaps with busy period, mark as unavailable
+                                if (busy_start <= slot_time < busy_end) or \
+                                   (busy_start < slot_end <= busy_end) or \
+                                   (slot_time <= busy_start and slot_end >= busy_end):
+                                    is_available = False
+                                    break
+                            
+                            if is_available:
+                                all_slots.append(slot_str)
             
             # Sort slots by date/time
             all_slots.sort()
             
-            # Use up to 15 available slots
-            available_slots = all_slots
+            # Use up to 50 available slots
+            available_slots = all_slots[:50]
             
             # Generate smart recommendations based on the calendar data
             recommended_slots = get_recommended_slots(available_slots, context_info)
