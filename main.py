@@ -13,6 +13,11 @@ import json
 import os
 from starlette.middleware.sessions import SessionMiddleware
 import re
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = FastAPI()
 app.include_router(auth_router)
@@ -341,6 +346,9 @@ async def create_event(request: Request, event: EventCreate):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create event: {str(e)}")
 
+# Get OpenAI API key from .env file
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 @app.post("/schedule/process-command")
 async def process_command(request: Request, command_request: NaturalLanguageCommand):
     """Process natural language scheduling commands"""
@@ -352,7 +360,7 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
         )
         
     try:
-        command = command_request.command.lower()
+        command = command_request.command
         
         # Get current available slots
         now = datetime.now(timezone.utc)
@@ -362,37 +370,127 @@ async def process_command(request: Request, command_request: NaturalLanguageComm
         freebusy_data = get_freebusy_data(credentials, now.isoformat(), time_max)
         busy_periods = freebusy_data.get('busy', [])
         
-        # Extract potential date and time from command
-        event_name, event_date, event_time, description = extract_event_info(command)
-        
         # Generate all available slots
         available_slots = generate_available_slots(now, 14, busy_periods)
         
-        # Find matching slots
-        matching_slots = find_matching_slots(available_slots, event_date, event_time)
+        # Filter out any slots that are in the past (just to be absolutely sure)
+        current_time = datetime.now(timezone.utc)
+        available_slots = [slot for slot in available_slots if datetime.fromisoformat(slot.replace('Z', '+00:00')) > current_time]
         
-        if matching_slots:
-            best_slot = matching_slots[0]
-            slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
-            
-            friendly_date = slot_dt.strftime("%A, %B %d at %I:%M %p")
-            
-            return {
-                "found_slot": best_slot,
-                "event_name": event_name,
-                "event_description": description,
-                "message": f"Found a slot for '{event_name}' on {friendly_date}. Click 'Schedule Event' to confirm."
-            }
+        # Format the available slots for the OpenAI API
+        formatted_slots = []
+        for slot in available_slots[:20]:  # Limit to first 20 slots to keep prompt size reasonable
+            slot_dt = datetime.fromisoformat(slot.replace('Z', '+00:00'))
+            formatted_slots.append(f"{slot} - {slot_dt.strftime('%A, %B %d at %I:%M %p')}")
+        
+        available_slots_str = "\n".join(formatted_slots)
+        
+        # Use OpenAI to extract event info and find the best slot
+        openai_response = process_with_openai(command, available_slots_str)
+        
+        if openai_response and openai_response.get("found_slot"):
+            return openai_response
         else:
-            return {
-                "found_slot": None,
-                "event_name": event_name,
-                "event_description": description,
-                "message": f"Could not find an available slot for '{event_name}' on the requested date/time. Please select a date and time manually."
-            }
+            # Fallback to simple extraction if OpenAI fails
+            event_name, event_date, event_time, description = extract_event_info(command.lower())
+            
+            # Find matching slots
+            matching_slots = find_matching_slots(available_slots, event_date, event_time)
+            
+            if matching_slots:
+                best_slot = matching_slots[0]
+                slot_dt = datetime.fromisoformat(best_slot.replace('Z', '+00:00'))
+                
+                friendly_date = slot_dt.strftime("%A, %B %d at %I:%M %p")
+                
+                return {
+                    "found_slot": best_slot,
+                    "event_name": event_name,
+                    "event_description": description,
+                    "message": f"Found a slot for '{event_name}' on {friendly_date}. Click 'Schedule Event' to confirm."
+                }
+            else:
+                return {
+                    "found_slot": None,
+                    "event_name": event_name,
+                    "event_description": description,
+                    "message": f"Could not find an available slot for '{event_name}' on the requested date/time. Please select a date and time manually."
+                }
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process command: {str(e)}")
+
+def process_with_openai(command, available_slots):
+    """Use OpenAI API to process the natural language command and find a matching slot"""
+    try:
+        # Check if OpenAI API key is set
+        if not OPENAI_API_KEY:
+            return None
+            
+        # Prepare the API request
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        # Get the current date and time for context
+        current_dt = datetime.now()
+        today_str = current_dt.strftime("%A, %B %d, %Y")
+        
+        # Create a prompt for OpenAI
+        prompt = f"""
+        Today is {today_str}.
+        
+        A user wants to schedule an event with this command: "{command}"
+        
+        The following time slots are available (all dates are in the future):
+        {available_slots}
+        
+        Parse the user's command and find the best matching available slot from the list above.
+        Extract the event name and any description.
+        
+        IMPORTANT:
+        1. Only return slots that are in the future (after {today_str})
+        2. Only recommend slots from the provided available slots list
+        3. Do not make up or suggest slots that are not in the list
+        
+        Respond with a valid JSON object in this exact format:
+        {{
+            "found_slot": "ISO datetime string like 2025-04-12T09:00:00+00:00",
+            "event_name": "extracted event name",
+            "event_description": "any description or details found in the command",
+            "message": "Human-friendly confirmation message"
+        }}
+        
+        Use ISO format for the found_slot. If no matching slot is found, set found_slot to null.
+        """
+        
+        # Call OpenAI API
+        payload = {
+            "model": "gpt-4-turbo-preview",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"}
+        }
+        
+        response = requests.post("https://api.openai.com/v1/chat/completions", 
+                               headers=headers, 
+                               json=payload)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            content = response_data['choices'][0]['message']['content']
+            
+            # Parse the JSON response from OpenAI
+            import json
+            parsed_result = json.loads(content)
+            
+            return parsed_result
+        else:
+            return None
+            
+    except Exception as e:
+        return None
 
 def extract_event_info(command):
     """Extract event name, date, time, and description from command"""
